@@ -27,6 +27,7 @@
 #include <string.h>
 #include <limits.h>
 #include "cmplog.h"
+#include "afl-interval.h"
 
 /* MOpt */
 
@@ -537,6 +538,277 @@ u8 fuzz_one_original(afl_state_t *afl) {
   }
 
   memcpy(out_buf, in_buf, len);
+  /******************************
+   * READ INFORMATION EXTRACTION*
+   * ****************************/
+// 16MB
+#define MAX_LEN 0x800000
+#ifdef DEBUG
+
+#define DEBUG_PRINT(file, fmt, ...)    \
+  {                                    \
+    fprintf(file, fmt, ##__VA_ARGS__); \
+    fflush(stdout);                    \
+  }
+
+#else
+#define DEBUG_PRINT(fmt, ...) \
+  {                           \
+  }
+#endif
+
+#define CHECK_INDEX(index, size) ((index) >= 0 && (index) < (size))
+#define PENDDING 20
+#define FLIP_BITS(arr, start, end)     \
+  do                                   \
+  {                                    \
+    for (int i = start; i <= end; i++) \
+    {                                  \
+      arr[i] = ~arr[i];                \
+    }                                  \
+  } while (0)
+#define SHUFFLE(arr, start, end)       \
+  do                                   \
+  {                                    \
+    for (int i = start; i <= end; i++) \
+    {                                  \
+      arr[i] = (u8)rand_below(afl,256);            \
+    }                                  \
+  } while (0)
+  if (!afl->non_instrumented_mode)
+  {
+
+    u8 *tmp_buf = NULL;
+    u32 tmp_len = len;
+    u32 *read_info = NULL;
+    u32 read_info_len = 0;
+    u32 expect_len = 0;
+    u32 ints_len = 0;
+    u32 merged_ints_len;
+    struct Interval ints[3072];
+    struct Interval waiting_ints[10240];
+    // run current program to collect information
+
+    u8 res = common_fuzz_stuff(afl, out_buf, len);
+
+
+    read_info = (int *)(afl->fsrv.trace_bits + afl->shm.map_size);
+    read_info_len = read_info[0];
+    
+    for (int i = 0; i < read_info_len; i++)
+    {
+      u32 pos = read_info[i * 3 + 1];
+      u32 read = read_info[i * 3 + 2];
+      u32 expect = read_info[i * 3 + 3];
+      expect = MAX(read, expect);
+      if (pos + expect >= MAX_LEN || expect == 0)
+      {
+        continue;
+      }
+      if (expect > 64)
+      {
+        ints[ints_len].start = pos;
+        ints[ints_len++].end = pos + 63;
+        ints[ints_len].start = pos + expect - 64;
+        ints[ints_len++].end = pos + expect - 1;
+      }
+      else
+      {
+        ints[ints_len].start = pos;
+        ints[ints_len++].end = pos + expect - 1;
+      }
+      if (expect_len < pos + expect + 1)
+      {
+        expect_len = pos + expect + 1;
+      }
+    }
+
+    tmp_len = MIN(MAX(expect_len, len), MAX_LEN) + PENDDING;
+    tmp_buf = ck_alloc_nozero(tmp_len);
+    memcpy(tmp_buf, out_buf, len);
+
+    // struct Interval *merged_ints = ints;
+    // merged_ints_len = ints_len;
+    struct Interval *merged_ints = deduplicateIntervals(ints, ints_len, &merged_ints_len);
+
+    u32 total_read = 0;
+    for (int i = 0; i < merged_ints_len; i++)
+    {
+      total_read += (merged_ints[i].end - merged_ints[i].start + 1);
+    }
+    afl->queue_cur->ratio = (double)total_read / tmp_len;
+
+    u8 *virgin_bits_copy = malloc(sizeof(u8)*afl->shm.map_size);
+    u8 *test_bits = malloc(sizeof(u8)*afl->shm.map_size);
+    if (afl->queue_cur->passed_det == 0 && ints_len > 0)
+    {
+
+      afl->stage_name = "read/magic";
+      afl->stage_max = 64;
+      afl->stage_cur = 0;
+      struct Interval first_read_int = merged_ints[0];
+      for(int i = 0 ; i<64 ; i++){
+        SHUFFLE(tmp_buf,first_read_int.start,first_read_int.end);
+        res = common_fuzz_stuff(afl, tmp_buf, tmp_len);
+        afl->stage_cur++;
+      }
+      memcpy(tmp_buf, out_buf, len);
+
+      for (int i = 0; i < merged_ints_len; i++)
+      {
+        u32 waiting_len = 0;
+        u32 cur_calc = 0;
+        struct Interval mutate_ints[10240];
+        u32 mutate_len = 0;
+        waiting_ints[0] = merged_ints[i];
+        memcpy(virgin_bits_copy, afl->virgin_bits, afl->shm.map_size);
+        while (cur_calc <= waiting_len && waiting_len < 10240)
+        {
+          memcpy(test_bits, virgin_bits_copy, afl->shm.map_size);
+          u32 start = waiting_ints[cur_calc].start;
+          u32 end = waiting_ints[cur_calc].end;
+          u32 int_len = end - start + 1;
+          FLIP_BITS(tmp_buf, start, end);
+          res = common_fuzz_stuff(afl, tmp_buf, tmp_len);
+          int nb = has_new_bits(afl,test_bits);
+          if (nb)
+          {
+            if (int_len <= 2)
+            {
+              mutate_ints[mutate_len % 10240].start = start;
+              mutate_ints[mutate_len++ % 10240].end = end;
+            }
+            else
+            {
+              waiting_ints[++waiting_len].start = start;
+              waiting_ints[waiting_len].end = (start + end) / 2;
+              waiting_ints[++waiting_len].start = (start + end) / 2 + 1;
+              waiting_ints[waiting_len].end = end;
+            }
+          }
+          cur_calc++;
+          FLIP_BITS(tmp_buf, start, end);
+        }
+
+        afl->stage_name = "read/iter";
+        afl->stage_max = mutate_len * 512 + 16;
+        afl->stage_cur = 0;
+        for (int i = 0; i < mutate_len; i++)
+        {
+          u32 bytes;
+          u32 start = mutate_ints[i].start;
+          u32 end = mutate_ints[i].end;
+
+          u8 origin[2];
+          origin[0] = tmp_buf[start];
+          origin[1] = tmp_buf[end];
+          for (bytes = 0; bytes < (1 << 8); bytes++)
+          {
+            tmp_buf[start] = bytes & 0xFF;
+            res = common_fuzz_stuff(afl, tmp_buf, tmp_len);
+            afl->stage_cur++;
+          }
+          for (bytes = 0; bytes < (1 << 8); bytes++)
+          {
+            tmp_buf[end] = bytes & 0xFF;
+            res = common_fuzz_stuff(afl, tmp_buf, tmp_len);
+            afl->stage_cur++;
+          }
+          tmp_buf[start] = origin[0];
+          tmp_buf[end] = origin[1];
+        }
+
+        if (mutate_len >= 4) {
+          afl->stage_name = "read/random";
+          afl->stage_max = 64 ;
+          afl->stage_cur = 0;
+          for (int i = 0; i < 1; i++) {
+            u32 first_int = rand_below(afl,mutate_len);
+            u32 second_int = rand_below(afl,mutate_len);
+            while (second_int == first_int)
+              second_int = rand_below(afl,mutate_len);
+            u32 bytes;
+            u32 start = mutate_ints[first_int].start;
+            u32 end = mutate_ints[second_int].end;
+            u8 origin[2];
+            origin[0] = tmp_buf[start];
+            origin[1] = tmp_buf[end];
+            for (bytes = 0; bytes < (1 << 8); bytes++) {
+              tmp_buf[end] = bytes & 0XFF;
+              tmp_buf[start] = bytes & 0xFF;
+              res = common_fuzz_stuff(afl, tmp_buf, tmp_len);
+              tmp_buf[start] = origin[0];
+              tmp_buf[end] = origin[1];
+              afl->stage_cur++;
+            }
+          }
+        }
+      }
+      u8 *tmp_copy = ck_alloc_nozero(tmp_len);
+      if (merged_ints_len >= 4) {
+        afl->stage_name = "read/ints_cross";
+        afl->stage_max = 64;
+        afl->stage_cur = 0;
+        for (int i = 0; i < afl->stage_max; i++) {
+          u32 first_int = rand_below(afl,merged_ints_len);
+          u32 second_int = rand_below(afl,merged_ints_len);
+          while (second_int == first_int)
+            second_int = rand_below(afl,merged_ints_len);
+          tmp_copy = memcpy(tmp_copy, tmp_buf, tmp_len);
+          SHUFFLE(tmp_copy, merged_ints[first_int].start,
+                  merged_ints[first_int].end);
+
+          SHUFFLE(tmp_copy, merged_ints[second_int].start,
+                  merged_ints[second_int].end);
+          common_fuzz_stuff(afl, tmp_copy, tmp_len);
+          afl->stage_cur++;
+        }
+      }
+
+      afl->stage_name = "read/int_random";
+      afl->stage_max = 4 * merged_ints_len;
+      afl->stage_cur = 0;
+      for (int i = 0; i < merged_ints_len; i++) {
+        memcpy(tmp_copy, tmp_buf, tmp_len);
+        u32 start = merged_ints[i].start;
+        u32 end = merged_ints[i].end;
+        for (int j = 0; j < 4; j++) {
+          SHUFFLE(tmp_copy, start, end);
+          common_fuzz_stuff(afl, tmp_copy, tmp_len);
+          afl->stage_cur++;
+        }
+      }
+
+      // stage_name = "read/reduce";
+      // stage_max = merged_ints_len;
+      // stage_cur = 0;
+      // memcpy(tmp_copy, tmp_buf, tmp_len);
+      // for (int i = 0; i < merged_ints_len; i++) {
+      //   u32 start = merged_ints[i].start;
+      //   u32 end = merged_ints[i].end;
+      //   if (end > 0 && end < tmp_len) {
+      //     common_fuzz_stuff(argv, tmp_copy, MAX(1,UR(end)));
+      //     stage_cur++;
+      //   }
+      // }
+      if (tmp_copy)
+        ck_free(tmp_copy);
+
+      if (merged_ints)
+        free(merged_ints); // NOTE: before free we should ensure the point is not
+                           //  null
+      if (tmp_buf)
+        ck_free(tmp_buf);
+      
+      if(virgin_bits_copy)
+        free(virgin_bits_copy);
+
+      if(test_bits)
+        free(test_bits);
+      afl->queue_cur->passed_det = 1;
+      // doing_det = 1;
+    }
+  }
 
   /*********************
    * PERFORMANCE SCORE *

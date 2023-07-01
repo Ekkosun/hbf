@@ -170,6 +170,7 @@ struct queue_entry {
   u32 bitmap_size,                      /* Number of bits set in bitmap     */
       fuzz_level,                       /* Number of fuzzing iterations     */
       n_fuzz_entry                      /* offset in n_fuzz                 */
+  
 #ifdef INTROSPECTION
       ,
       stats_selected,                   /* stats: how often selected        */
@@ -179,6 +180,7 @@ struct queue_entry {
       stats_tmouts                      /* stats: # of saved timeouts       */
 #endif
       ;
+  double ratio;
 
   u64 exec_us,                          /* Execution time (us)              */
       handicap,                         /* Number of queue cycles behind    */

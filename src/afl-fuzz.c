@@ -1922,7 +1922,6 @@ int main(int argc, char **argv_orig, char **envp) {
       snprintf(tmpfile, PATH_MAX, "%s/.cur_input", afl->tmp_dir);
 
     }
-
     /* there is still a race condition here, but well ... */
     if (access(tmpfile, F_OK) != -1) {
 
@@ -1938,7 +1937,6 @@ int main(int argc, char **argv_orig, char **envp) {
     afl->tmp_dir = afl->out_dir;
 
   }
-
   /* If we don't have a file name chosen yet, use a safe default. */
 
   if (!afl->fsrv.out_file) {
@@ -1975,7 +1973,7 @@ int main(int argc, char **argv_orig, char **envp) {
     }
 
   }
-
+  setenv("AFL_OUTPUT_FILE",afl->fsrv.out_file,0);
   if (!afl->fsrv.out_file) { setup_stdio_file(afl); }
 
   if (afl->cmplog_binary) {
